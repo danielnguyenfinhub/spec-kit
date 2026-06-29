@@ -214,6 +214,7 @@ class TestGenericIntegration:
         [
             "analyze",
             "clarify",
+            "converge",
             "implement",
             "plan",
             "checklist",
@@ -245,16 +246,14 @@ class TestGenericIntegration:
     # -- CLI --------------------------------------------------------------
 
     def test_cli_generic_without_commands_dir_fails(self, tmp_path):
-        """--integration generic without --ai-commands-dir should fail."""
+        """--integration generic without --integration-options should fail."""
         from typer.testing import CliRunner
         from specify_cli import app
         runner = CliRunner()
         result = runner.invoke(app, [
             "init", str(tmp_path / "test-generic"), "--integration", "generic",
-            "--script", "sh", "--no-git",
         ])
-        # Generic requires --commands-dir / --ai-commands-dir
-        # The integration path validates via setup()
+        # Generic requires --commands-dir via --integration-options
         assert result.exit_code != 0
 
     def test_init_options_includes_context_file(self, tmp_path):
@@ -270,8 +269,8 @@ class TestGenericIntegration:
             os.chdir(project)
             result = CliRunner().invoke(app, [
                 "init", "--here", "--integration", "generic",
-                "--ai-commands-dir", ".myagent/commands",
-                "--script", "sh", "--no-git",
+                "--integration-options=--commands-dir .myagent/commands",
+                "--script", "sh",
             ], catch_exceptions=False)
         finally:
             os.chdir(old_cwd)
@@ -281,7 +280,7 @@ class TestGenericIntegration:
         assert ext_cfg.get("context_file") == "AGENTS.md"
 
     def test_complete_file_inventory_sh(self, tmp_path):
-        """Every file produced by specify init --integration generic --ai-commands-dir ... --script sh."""
+        """Every file produced by specify init --integration generic --integration-options=--commands-dir ... --script sh."""
         from typer.testing import CliRunner
         from specify_cli import app
 
@@ -292,15 +291,15 @@ class TestGenericIntegration:
             os.chdir(project)
             result = CliRunner().invoke(app, [
                 "init", "--here", "--integration", "generic",
-                "--ai-commands-dir", ".myagent/commands",
-                "--script", "sh", "--no-git",
+                "--integration-options=--commands-dir .myagent/commands",
+                "--script", "sh",
             ], catch_exceptions=False)
         finally:
             os.chdir(old_cwd)
         assert result.exit_code == 0, f"init failed: {result.output}"
         actual = sorted(
             p.relative_to(project).as_posix()
-            for p in project.rglob("*") if p.is_file()
+            for p in project.rglob("*") if p.is_file() and ".git" not in p.parts
         )
         expected = sorted([
             "AGENTS.md",
@@ -308,6 +307,7 @@ class TestGenericIntegration:
             ".myagent/commands/speckit.checklist.md",
             ".myagent/commands/speckit.clarify.md",
             ".myagent/commands/speckit.constitution.md",
+            ".myagent/commands/speckit.converge.md",
             ".myagent/commands/speckit.implement.md",
             ".myagent/commands/speckit.plan.md",
             ".myagent/commands/speckit.specify.md",
@@ -345,7 +345,7 @@ class TestGenericIntegration:
         )
 
     def test_complete_file_inventory_ps(self, tmp_path):
-        """Every file produced by specify init --integration generic --ai-commands-dir ... --script ps."""
+        """Every file produced by specify init --integration generic --integration-options=--commands-dir ... --script ps."""
         from typer.testing import CliRunner
         from specify_cli import app
 
@@ -356,15 +356,15 @@ class TestGenericIntegration:
             os.chdir(project)
             result = CliRunner().invoke(app, [
                 "init", "--here", "--integration", "generic",
-                "--ai-commands-dir", ".myagent/commands",
-                "--script", "ps", "--no-git",
+                "--integration-options=--commands-dir .myagent/commands",
+                "--script", "ps",
             ], catch_exceptions=False)
         finally:
             os.chdir(old_cwd)
         assert result.exit_code == 0, f"init failed: {result.output}"
         actual = sorted(
             p.relative_to(project).as_posix()
-            for p in project.rglob("*") if p.is_file()
+            for p in project.rglob("*") if p.is_file() and ".git" not in p.parts
         )
         expected = sorted([
             "AGENTS.md",
@@ -372,6 +372,7 @@ class TestGenericIntegration:
             ".myagent/commands/speckit.checklist.md",
             ".myagent/commands/speckit.clarify.md",
             ".myagent/commands/speckit.constitution.md",
+            ".myagent/commands/speckit.converge.md",
             ".myagent/commands/speckit.implement.md",
             ".myagent/commands/speckit.plan.md",
             ".myagent/commands/speckit.specify.md",
