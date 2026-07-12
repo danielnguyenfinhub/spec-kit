@@ -710,6 +710,15 @@ class TestPresetManager:
         manifest = PresetManifest(pack_dir / "preset.yml")
         assert manager.check_compatibility(manifest, "0.1.5") is True
 
+    def test_check_compatibility_prerelease(self, pack_dir, temp_dir):
+        """Test compatibility check allows prereleases and fails on boundary."""
+        manager = PresetManager(temp_dir)
+        manifest = PresetManifest(pack_dir / "preset.yml")
+        # manifest requires >=0.1.0
+        assert manager.check_compatibility(manifest, "0.8.8.dev0") is True
+        with pytest.raises(PresetCompatibilityError, match="Preset requires spec-kit"):
+            manager.check_compatibility(manifest, "0.1.0.dev0")
+
     def test_check_compatibility_invalid(self, pack_dir, temp_dir):
         """Test compatibility check with invalid specifier."""
         manager = PresetManager(temp_dir)
@@ -1423,6 +1432,27 @@ class TestPresetCatalog:
         catalog = PresetCatalog(project_dir)
         catalog._validate_catalog_url("http://localhost:8080/catalog.json")
         catalog._validate_catalog_url("http://127.0.0.1:8080/catalog.json")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://:8080",                # port only, no host
+            "https://:8080/catalog.json",   # port only, with path
+            "https://:0",                   # port only, no host
+            "https://user@",                # userinfo only, no host
+            "https://user:pass@",           # userinfo only, no host
+        ],
+    )
+    def test_validate_catalog_url_hostless_rejected(self, project_dir, url):
+        """Reject host-less URLs whose netloc is truthy but hostname is None (#3209).
+
+        ``urlparse('https://:8080').netloc`` is ``':8080'`` (truthy) but its
+        ``hostname`` is ``None``, so a netloc-based check would accept a URL
+        with no actual host, contradicting the "valid URL with a host" error.
+        """
+        catalog = PresetCatalog(project_dir)
+        with pytest.raises(PresetValidationError, match="valid URL with a host"):
+            catalog._validate_catalog_url(url)
 
     def test_env_var_catalog_url(self, project_dir, monkeypatch):
         """Test catalog URL from environment variable."""
@@ -4506,6 +4536,27 @@ class TestBundledPresetLocator:
         output = strip_ansi(result.output)
         assert "URL must use HTTPS with a hostname" in output
         assert "got https://" not in output
+        open_url.assert_not_called()
+
+    def test_preset_add_from_malformed_ipv6_url_exits_cleanly(self, project_dir):
+        """A malformed IPv6 URL must produce a clean error, not a ValueError traceback."""
+        from typer.testing import CliRunner
+        from unittest.mock import patch
+        from specify_cli import app
+
+        runner = CliRunner()
+        with patch.object(Path, "cwd", return_value=project_dir), \
+             patch("specify_cli.authentication.http.open_url") as open_url:
+            result = runner.invoke(
+                app,
+                ["preset", "add", "--from", "https://[::1/preset.zip"],
+                catch_exceptions=True,
+            )
+
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        output = strip_ansi(result.output)
+        assert "Invalid URL" in output
         open_url.assert_not_called()
 
     def test_preset_add_from_url_redirect_error_describes_disallowed_url(self, project_dir, monkeypatch, capsys):

@@ -426,7 +426,11 @@ def extension_add(
     if from_url and not dev:
         from urllib.parse import urlparse
 
-        parsed = urlparse(from_url)
+        try:
+            parsed = urlparse(from_url)
+        except ValueError:
+            console.print(f"[red]Error:[/red] Invalid URL: {_escape_markup(from_url)}")
+            raise typer.Exit(1)
         is_localhost = parsed.hostname in ("localhost", "127.0.0.1", "::1")
 
         if parsed.scheme != "https" and not (parsed.scheme == "http" and is_localhost):
@@ -482,6 +486,7 @@ def extension_add(
 
             elif from_url:
                 # Install from URL (ZIP file)
+                import io
                 import urllib.error
 
                 console.print(f"Downloading from {safe_url}...")
@@ -498,10 +503,33 @@ def extension_add(
                     zip_path = Path(download_file.name)
 
                 try:
-                    from specify_cli.authentication.http import open_url as _open_url
+                    # Use the catalog's authenticated fetch so configured
+                    # credentials (incl. GitHub Enterprise Server) are applied
+                    # and GHES release-asset URLs resolve via /api/v3 — keeping
+                    # --from consistent with catalog-based installs.
+                    dl_catalog = ExtensionCatalog(project_root)
+                    download_url = from_url
+                    extra_headers = None
+                    resolved_url = dl_catalog._resolve_github_release_asset_api_url(download_url)
+                    if resolved_url:
+                        download_url = resolved_url
+                        extra_headers = {"Accept": "application/octet-stream"}
 
-                    with _open_url(from_url, timeout=60) as response:
+                    with dl_catalog._open_url(
+                        download_url, timeout=60, extra_headers=extra_headers
+                    ) as response:
                         zip_data = response.read()
+
+                    if not zipfile.is_zipfile(io.BytesIO(zip_data)):
+                        console.print(
+                            f"[red]Error:[/red] {safe_url} did not return a ZIP archive "
+                            f"(got {len(zip_data)} bytes). This usually means the request "
+                            f"was not authenticated and a login/HTML page was returned. "
+                            f"Verify the URL is correct and that credentials for its host "
+                            f"are configured in ~/.specify/auth.json."
+                        )
+                        raise typer.Exit(1)
+
                     zip_path.write_bytes(zip_data)
 
                     # Install from downloaded ZIP

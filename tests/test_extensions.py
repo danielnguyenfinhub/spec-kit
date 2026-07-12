@@ -31,14 +31,19 @@ from specify_cli.extensions import (
     ExtensionRegistry,
     ExtensionManager,
     CommandRegistrar,
+    ConfigManager,
     HookExecutor,
     ExtensionCatalog,
     ExtensionError,
     ValidationError,
     CompatibilityError,
     normalize_priority,
-    version_satisfies,
 )
+from specify_cli._utils import version_satisfies
+
+# Minimal valid ZIP (empty end-of-central-directory record). Passes
+# zipfile.is_zipfile() so --from download tests exercise the content guard.
+_MINIMAL_ZIP_BYTES = b"PK\x05\x06" + b"\x00" * 18
 
 
 def can_create_symlink(tmp_path: Path) -> bool:
@@ -228,6 +233,73 @@ class TestExtensionManifest:
         }
 
         assert CORE_COMMAND_NAMES == expected
+
+    def test_load_core_command_names_discovers_from_source_checkout(self, monkeypatch):
+        """Discovery must actually read the repo-root templates, not silently
+        fall back (#3274).
+
+        The fallback set happens to equal the real command stems today, so an
+        equality check against the live tree cannot tell a working loader apart
+        from a dead one. Point ``_repo_root`` at a temp tree with *different*
+        command names: the old off-by-one path math read nothing and returned
+        the baked-in fallback; the fixed loader returns the temp stems.
+        """
+        from specify_cli.extensions import (
+            _load_core_command_names,
+            _FALLBACK_CORE_COMMAND_NAMES,
+        )
+        import specify_cli.extensions as ext
+
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = Path(tmp) / "templates" / "commands"
+            commands.mkdir(parents=True)
+            (commands / "widget.md").write_text("# widget", encoding="utf-8")
+            (commands / "gadget.md").write_text("# gadget", encoding="utf-8")
+            (commands / "notacommand.txt").write_text("skip me", encoding="utf-8")
+
+            # No wheel bundle in this scenario; force the source-checkout path.
+            monkeypatch.setattr(ext, "_locate_core_pack", lambda: None)
+            monkeypatch.setattr(ext, "_repo_root", lambda: Path(tmp))
+
+            result = _load_core_command_names()
+
+        assert result == {"widget", "gadget"}
+        assert result != _FALLBACK_CORE_COMMAND_NAMES
+
+    def test_load_core_command_names_prefers_wheel_core_pack(self, monkeypatch):
+        """When a wheel ``core_pack`` bundle exists, discovery reads
+        ``core_pack/commands`` (the force-include target) ahead of the source
+        tree (#3274)."""
+        from specify_cli.extensions import _load_core_command_names
+        import specify_cli.extensions as ext
+
+        with tempfile.TemporaryDirectory() as tmp:
+            core_pack = Path(tmp) / "core_pack"
+            (core_pack / "commands").mkdir(parents=True)
+            (core_pack / "commands" / "sprocket.md").write_text("# sprocket", encoding="utf-8")
+
+            monkeypatch.setattr(ext, "_locate_core_pack", lambda: core_pack)
+            # Source fallback should be ignored while the bundle resolves.
+            monkeypatch.setattr(ext, "_repo_root", lambda: Path(tmp) / "nonexistent")
+
+            result = _load_core_command_names()
+
+        assert result == {"sprocket"}
+
+    def test_load_core_command_names_falls_back_when_nothing_found(self, monkeypatch):
+        """With neither a bundle nor a source tree, discovery returns the
+        baked-in fallback so validation still works (#3274)."""
+        from specify_cli.extensions import (
+            _load_core_command_names,
+            _FALLBACK_CORE_COMMAND_NAMES,
+        )
+        import specify_cli.extensions as ext
+
+        with tempfile.TemporaryDirectory() as tmp:
+            monkeypatch.setattr(ext, "_locate_core_pack", lambda: None)
+            monkeypatch.setattr(ext, "_repo_root", lambda: Path(tmp) / "nonexistent")
+
+            assert _load_core_command_names() == _FALLBACK_CORE_COMMAND_NAMES
 
     def test_missing_required_field(self, temp_dir):
         """Test manifest missing required field."""
@@ -1001,6 +1073,14 @@ class TestExtensionManager:
         with pytest.raises(CompatibilityError, match="Extension requires spec-kit"):
             manager.check_compatibility(manifest, "0.0.1")
 
+    def test_check_compatibility_allows_prerelease_builds(self, extension_dir, project_dir):
+        """Prerelease spec-kit builds should satisfy compatible version ranges."""
+        manager = ExtensionManager(project_dir)
+        manifest = ExtensionManifest(extension_dir / "extension.yml")
+
+        result = manager.check_compatibility(manifest, "0.8.8.dev0")
+        assert result is True
+
     def test_install_from_directory(self, extension_dir, project_dir):
         """Test installing extension from directory."""
         manager = ExtensionManager(project_dir)
@@ -1067,10 +1147,12 @@ class TestExtensionManager:
             context_note=None,
             link_outputs=False,
             create_missing_active_skills_dir=False,
+            extension_id=None,
         ):
             captured["create_missing_active_skills_dir"] = (
                 create_missing_active_skills_dir
             )
+            captured["extension_id"] = extension_id
             return {}
 
         monkeypatch.setattr(
@@ -1084,6 +1166,7 @@ class TestExtensionManager:
         registrar.register_commands_for_all_agents(manifest, extension_dir, project_dir)
 
         assert captured["create_missing_active_skills_dir"] is False
+        assert captured["extension_id"] == manifest.id
 
     def test_install_duplicate(self, extension_dir, project_dir):
         """Test installing already installed extension."""
@@ -1615,6 +1698,29 @@ $ARGUMENTS
         assert adjusted["scripts"]["sh"] == ".specify/extensions/test-ext/scripts/setup.sh {ARGS}"
         assert adjusted["scripts"]["ps"] == ".specify/scripts/powershell/setup-plan.ps1 {ARGS}"
 
+    def test_adjust_script_paths_rewrites_extension_top_level_scripts(self):
+        """Extension command-local scripts should resolve under the installed extension."""
+        from specify_cli.agents import CommandRegistrar as AgentCommandRegistrar
+
+        registrar = AgentCommandRegistrar()
+        original = {
+            "scripts": {
+                "sh": "scripts/bash/resolve-skill.sh {ARGS}",
+                "ps": "../../scripts/powershell/setup-plan.ps1 -Json",
+            }
+        }
+
+        adjusted = registrar._adjust_script_paths(original, extension_id="test-ext")
+
+        assert (
+            adjusted["scripts"]["sh"]
+            == ".specify/extensions/test-ext/scripts/bash/resolve-skill.sh {ARGS}"
+        )
+        assert (
+            adjusted["scripts"]["ps"]
+            == ".specify/scripts/powershell/setup-plan.ps1 -Json"
+        )
+
     def test_rewrite_project_relative_paths_preserves_extension_local_body_paths(self):
         """Body rewrites should preserve extension-local assets while fixing top-level refs."""
         from specify_cli.agents import CommandRegistrar as AgentCommandRegistrar
@@ -1628,6 +1734,24 @@ $ARGUMENTS
 
         assert ".specify/extensions/test-ext/templates/spec.md" in rewritten
         assert ".specify/scripts/bash/setup-plan.sh" in rewritten
+
+    def test_rewrite_project_relative_paths_uses_extension_context_for_scripts(self):
+        """Extension source bodies treat top-level scripts/ as extension-local."""
+        from specify_cli.agents import CommandRegistrar as AgentCommandRegistrar
+
+        body = (
+            "Run scripts/bash/ensure-skills.sh\n"
+            "Fallback ../../scripts/bash/setup-plan.sh\n"
+            "Read templates/checklist.md\n"
+        )
+
+        rewritten = AgentCommandRegistrar.rewrite_project_relative_paths(
+            body, extension_id="test-ext"
+        )
+
+        assert ".specify/extensions/test-ext/scripts/bash/ensure-skills.sh" in rewritten
+        assert ".specify/scripts/bash/setup-plan.sh" in rewritten
+        assert ".specify/templates/checklist.md" in rewritten
 
     def test_render_toml_command_handles_embedded_triple_double_quotes(self):
         """TOML renderer should stay valid when body includes triple double-quotes."""
@@ -1670,6 +1794,25 @@ $ARGUMENTS
         parsed = tomllib.loads(output)
 
         assert parsed["description"] == "first line\nsecond line\n"
+
+    def test_render_toml_command_escapes_control_characters(self):
+        """Control characters and a lone CR must be escaped so the TOML parses.
+
+        TOML forbids literal control characters (U+0000–U+001F except tab and
+        newline, plus U+007F) in any string, and treats a bare CR outside a
+        CRLF pair as illegal. The renderer used to emit these raw — into a
+        basic string (single-line) or a ``\"\"\"`` multiline string (for a lone
+        CR) — producing a command file that fails to parse."""
+        from specify_cli.agents import CommandRegistrar as AgentCommandRegistrar
+
+        registrar = AgentCommandRegistrar()
+        body = "start\x00null\x01ctrl\x1besc\x7fdel\rlone-cr end"
+        output = registrar.render_toml_command(
+            {"description": "d"}, body, "extension:test-ext"
+        )
+
+        parsed = tomllib.loads(output)
+        assert parsed["prompt"] == body
 
     def test_render_toml_command_preserves_backslashes_in_body(self):
         """A backslash in the body (e.g. a Windows path) must not break TOML.
@@ -2624,6 +2767,12 @@ class TestVersionSatisfies:
         """Test complex version specifier."""
         assert version_satisfies("1.0.5", ">=1.0.0,!=1.0.3")
         assert not version_satisfies("1.0.3", ">=1.0.0,!=1.0.3")
+
+    def test_version_satisfies_prerelease(self):
+        """Prerelease builds should satisfy compatible lower bounds, but not higher bounds."""
+        assert version_satisfies("0.8.8.dev0", ">=0.2.0")
+        assert not version_satisfies("0.2.0.dev0", ">=0.2.0")
+        assert not version_satisfies("0.8.7.dev1", ">=0.8.8")
 
     def test_version_satisfies_invalid(self):
         """Test invalid version strings."""
@@ -5311,6 +5460,29 @@ class TestExtensionAddCLI:
                 f"confirm must precede spinner, got: {call_order}"
         assert result.exit_code == 0  # user declined → clean exit
 
+    def test_add_from_malformed_ipv6_url_exits_cleanly(self, tmp_path):
+        """A malformed IPv6 URL must produce a clean error, not a ValueError traceback."""
+        from typer.testing import CliRunner
+        from unittest.mock import patch
+        from specify_cli import app
+
+        project_dir = tmp_path / "test-project"
+        project_dir.mkdir()
+        (project_dir / ".specify").mkdir()
+
+        runner = CliRunner()
+        with patch.object(Path, "cwd", return_value=project_dir):
+            result = runner.invoke(
+                app,
+                ["extension", "add", "my-ext", "--from", "https://[::1/ext.zip"],
+                catch_exceptions=True,
+            )
+
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        plain = strip_ansi(result.output)
+        assert "Invalid URL" in plain
+
     def test_add_status_escapes_extension_markup(self, tmp_path):
         """User-controlled extension names must not be parsed as Rich markup."""
         from rich.markup import escape as escape_markup
@@ -5378,7 +5550,7 @@ class TestExtensionAddCLI:
         runner = CliRunner()
         with patch.object(Path, "cwd", return_value=project_dir), \
              patch("typer.confirm", return_value=True), \
-             patch("specify_cli.authentication.http.open_url", return_value=FakeResponse(b"zip-bytes")), \
+             patch("specify_cli.authentication.http.open_url", return_value=FakeResponse(_MINIMAL_ZIP_BYTES)), \
              patch.object(ExtensionManager, "install_from_zip", fake_install_from_zip), \
              patch.object(ExtensionRegistry, "get", return_value={}):
             result = runner.invoke(
@@ -5445,6 +5617,98 @@ class TestExtensionAddCLI:
         assert result.exit_code == 1, result.output
         assert "https://example.com/[red]ext[/red].zip" in result.output
         assert "bad [red]download[/red]" in result.output
+
+    def test_add_from_url_rejects_non_zip_login_page(self, tmp_path):
+        """An HTML login page (unauthenticated fetch) must fail clearly, not BadZipFile."""
+        import io
+        from typer.testing import CliRunner
+        from unittest.mock import patch
+        from specify_cli import app
+
+        class FakeResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        project_dir = tmp_path / "test-project"
+        project_dir.mkdir()
+        (project_dir / ".specify").mkdir()
+
+        runner = CliRunner()
+        with patch.object(Path, "cwd", return_value=project_dir), \
+             patch("typer.confirm", return_value=True), \
+             patch(
+                 "specify_cli.authentication.http.open_url",
+                 return_value=FakeResponse(b"<!DOCTYPE html><html>Sign in</html>"),
+             ), \
+             patch.object(ExtensionManager, "install_from_zip") as install:
+            result = runner.invoke(
+                app,
+                ["extension", "add", "my-ext", "--from", "https://raw.ghe.example/o/r/ext.zip"],
+                catch_exceptions=True,
+            )
+
+        assert result.exit_code == 1, result.output
+        assert "did not return a ZIP archive" in result.output
+        install.assert_not_called()
+
+    def test_add_from_url_resolves_ghes_release_asset(self, tmp_path):
+        """A GHES release-download URL resolves to /api/v3 with octet-stream Accept."""
+        import io
+        from types import SimpleNamespace
+        from typer.testing import CliRunner
+        from unittest.mock import patch
+        from specify_cli import app
+        import json
+
+        class FakeResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        project_dir = tmp_path / "test-project"
+        project_dir.mkdir()
+        (project_dir / ".specify").mkdir()
+        seen = {}
+
+        def fake_open_url(url, timeout=10, extra_headers=None, redirect_validator=None):
+            if "/releases/tags/" in url:
+                body = json.dumps({
+                    "assets": [{
+                        "name": "ext.zip",
+                        "url": "https://ghes.example/api/v3/repos/org/repo/releases/assets/42",
+                    }]
+                }).encode()
+                return FakeResponse(body)
+            seen["url"] = url
+            seen["headers"] = extra_headers
+            return FakeResponse(_MINIMAL_ZIP_BYTES)
+
+        def fake_install(self_obj, zip_path, speckit_version, priority=10, force=False):
+            return SimpleNamespace(
+                id="x", name="X", version="1.0.0", description="", warnings=[], commands=[], hooks=[]
+            )
+
+        runner = CliRunner()
+        with patch.object(Path, "cwd", return_value=project_dir), \
+             patch("typer.confirm", return_value=True), \
+             patch("specify_cli.authentication.http.github_provider_hosts", return_value=("ghes.example",)), \
+             patch("specify_cli.authentication.http.open_url", side_effect=fake_open_url), \
+             patch.object(ExtensionManager, "install_from_zip", fake_install):
+            result = runner.invoke(
+                app,
+                ["extension", "add", "x", "--from",
+                 "https://ghes.example/org/repo/releases/download/v1.0/ext.zip"],
+                catch_exceptions=True,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "/api/v3/repos/org/repo/releases/assets/" in seen["url"]
+        assert seen["headers"] == {"Accept": "application/octet-stream"}
 
     @pytest.mark.parametrize(
         ("exc_type", "label"),
@@ -5523,7 +5787,7 @@ class TestExtensionAddCLI:
         runner = CliRunner()
         with patch.object(Path, "cwd", return_value=project_dir), \
              patch("typer.confirm", return_value=True), \
-             patch("specify_cli.authentication.http.open_url", return_value=FakeResponse(b"zip-bytes")), \
+             patch("specify_cli.authentication.http.open_url", return_value=FakeResponse(_MINIMAL_ZIP_BYTES)), \
              patch.object(ExtensionManager, "install_from_zip", fake_install_from_zip):
             result = runner.invoke(
                 app,
@@ -5532,7 +5796,7 @@ class TestExtensionAddCLI:
             )
 
         assert result.exit_code == 0
-        assert installed["zip_bytes"] == b"zip-bytes"
+        assert installed["zip_bytes"] == _MINIMAL_ZIP_BYTES
         assert installed["zip_path"].resolve().is_relative_to(downloads_dir.resolve())
         assert installed["zip_path"].name.startswith("extension-url-download-")
         assert not installed["zip_path"].exists()
@@ -7315,3 +7579,52 @@ def test_extension_wrapper_resolves_ghes_asset_when_host_configured(tmp_path, mo
     )
     assert resolved == "https://ghes.example/api/v3/repos/o/r/releases/assets/7"
     assert captured == ["https://ghes.example/api/v3/repos/o/r/releases/tags/v1"]
+
+
+class TestConfigManagerNonMappingYaml:
+    """A non-mapping YAML config root must not crash config/hook resolution."""
+
+    def _make(self, tmp_path, body: str):
+        ext_dir = tmp_path / ".specify" / "extensions" / "jira"
+        ext_dir.mkdir(parents=True)
+        (ext_dir / "jira-config.yml").write_text(body, encoding="utf-8")
+        return ConfigManager(tmp_path, "jira")
+
+    def test_get_config_coerces_list_root(self, tmp_path):
+        """A YAML list root previously raised AttributeError in _merge_configs."""
+        cm = self._make(tmp_path, "- foo\n- bar\n")
+        assert cm.get_config() == {}
+
+    def test_get_config_coerces_scalar_root(self, tmp_path):
+        cm = self._make(tmp_path, "just a string\n")
+        assert cm.get_config() == {}
+
+    def test_has_value_and_get_value_do_not_raise(self, tmp_path):
+        cm = self._make(tmp_path, "- foo\n")
+        assert cm.has_value("anything") is False
+        assert cm.get_value("anything") is None
+
+    def test_valid_local_config_layers_over_list_root_project_config(self, tmp_path):
+        """A malformed project config must not block a valid local config."""
+        ext_dir = tmp_path / ".specify" / "extensions" / "jira"
+        ext_dir.mkdir(parents=True)
+        (ext_dir / "jira-config.yml").write_text("- foo\n- bar\n", encoding="utf-8")
+        (ext_dir / "local-config.yml").write_text(
+            "notifications:\n  enabled: true\n", encoding="utf-8"
+        )
+        cm = ConfigManager(tmp_path, "jira")
+        assert cm.get_value("notifications.enabled") is True
+
+    def test_hook_condition_returns_false_without_raising(self, tmp_path):
+        """`config.x is set` on a scalar-root config must evaluate cleanly.
+
+        Before the fix, _merge_configs raised AttributeError and the
+        exception was swallowed by should_execute_hook, silently disabling
+        every config-based hook for the extension. Assert on
+        _evaluate_condition directly so the crash isn't masked.
+        """
+        ext_dir = tmp_path / ".specify" / "extensions" / "jira"
+        ext_dir.mkdir(parents=True)
+        (ext_dir / "jira-config.yml").write_text("just a string\n", encoding="utf-8")
+        executor = HookExecutor(tmp_path)
+        assert executor._evaluate_condition("config.x is set", "jira") is False

@@ -37,7 +37,7 @@ jobs:
           fi
 
       - name: Run markdownlint-cli2
-        uses: DavidAnson/markdownlint-cli2-action@ded1f9488f68a970bc66ea5619e13e9b52e601cd # v23
+        uses: DavidAnson/markdownlint-cli2-action@8de2aa07cae85fd17c0b35642db70cf5495f1d25 # v24.0.0
         with:
           globs: |
             '**/*.md'
@@ -54,3 +54,16 @@ jobs:
       # (notably SC2155). Tighten in a follow-up after cleanup.
       - name: Run shellcheck on shell scripts
         run: git ls-files -z -- '*.sh' | xargs -0 shellcheck --severity=error
+
+      # macOS ships bash 3.2, where bash 4+ case-modification parameter
+      # expansions error with "bad substitution". shellcheck assumes bash 4+
+      # from the shebang and cannot flag these, so guard explicitly; use tr
+      # for portable case conversion.
+      - name: Reject bash 4+ case-modification expansions
+        run: |
+          matches=$(git ls-files -z -- '*.sh' | xargs -0 grep -nE '\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?(\^\^?|,,?|~~?|@[UuLl])[^}]*\}' || true)
+          if [ -n "$matches" ]; then
+            echo "Found bash 4+ case-modification expansion(s); use tr for portability (macOS ships bash 3.2):"
+            echo "$matches"
+            exit 1
+          fi

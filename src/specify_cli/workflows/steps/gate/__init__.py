@@ -73,7 +73,14 @@ class GateStep(StepBase):
         choice = self._prompt(self._compose_prompt(message, show_file), options)
         output["choice"] = choice
 
-        if choice in ("reject", "abort"):
+        # Match rejection case-insensitively. ``_prompt`` echoes the option's
+        # original casing, and ``validate`` accepts a reject option
+        # case-insensitively (``o.lower() in {"reject", "abort"}``), so a gate
+        # authored as ``options: [Approve, Reject]`` passes validation. Comparing
+        # ``choice`` case-sensitively here would then treat a ``Reject`` pick as
+        # approval and silently skip the abort — the reject path must agree with
+        # the check that let the option through.
+        if choice.lower() in ("reject", "abort"):
             if on_reject == "abort":
                 output["aborted"] = True
                 return StepResult(
@@ -194,7 +201,14 @@ class GateStep(StepBase):
                 f"Gate step {config.get('id', '?')!r}: 'on_reject' must be "
                 f"'abort', 'skip', or 'retry'."
             )
-        if on_reject in ("abort", "retry") and isinstance(options, list):
+        # Only inspect option text when every option is a string; otherwise the
+        # `o.lower()` below would raise AttributeError on a non-string option
+        # (already reported above) and break validate_workflow's never-raise contract.
+        if (
+            on_reject in ("abort", "retry")
+            and isinstance(options, list)
+            and all(isinstance(o, str) for o in options)
+        ):
             reject_choices = {"reject", "abort"}
             if not any(o.lower() in reject_choices for o in options):
                 errors.append(
