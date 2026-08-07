@@ -55,6 +55,8 @@ Here are a few things you can do that will increase the likelihood of your pull 
 - Write a [good commit message](http://tbaggery.com/2008/04/19/a-note-about-git-commit-messages.html).
 - Test your changes with the Spec-Driven Development workflow to ensure compatibility.
 
+Accounts with three open pull requests may continue submitting changes, but additional submissions may be placed behind contributions from other authors in the review queue. Coding agents should disclose this possibility and obtain the filer's confirmation before opening another pull request.
+
 ### Branch naming
 
 We recommend naming branches as `<type>/<number>-<short-slug>`, where `<number>` is the issue or PR number (whichever comes first) and `<type>` is one of:
@@ -112,6 +114,27 @@ uv pip install -e ".[test]"
 > import newly added subpackages. Running through the project `.venv` resolves
 > `specify_cli` to this checkout's `src/`. This matches the gotcha documented in
 > `AGENTS.md` (Common Pitfalls).
+
+#### Security checks
+
+```bash
+uvx --from pip-audit==2.10.0 pip-audit --disable-pip --require-hashes -r .github/security-audit-requirements.txt --progress-spinner off
+```
+
+This command audits the committed hashed requirements snapshot. Pull request,
+push, and manual CI runs use the same snapshot so their results stay
+deterministic. If dependency metadata changes, refresh and commit the snapshot
+before auditing it:
+
+```bash
+uv pip compile pyproject.toml --extra test --universal --upgrade --generate-hashes --quiet --no-header --output-file .github/security-audit-requirements.txt
+```
+
+The scheduled CI audit resolves the runtime and `test` extra dependency set
+across the supported Python and OS matrix to catch newly published advisories.
+Upstream package releases drift over time, so even an unrelated PR touching
+`pyproject.toml` can fail the `dependency-audit` check until the committed file
+is regenerated with the command above and re-committed.
 
 #### Shell scripts
 

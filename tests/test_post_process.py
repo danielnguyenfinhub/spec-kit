@@ -243,3 +243,60 @@ class TestRegressionPlainTemplate:
         assert output_file.exists(), f"Output file missing for {agent}"
         content = output_file.read_text(encoding="utf-8")
         assert body_text.strip() in content, f"Body text missing in {agent} output"
+
+
+class TestClineRealPostProcess:
+    """Cline's real command-content transforms (hook-command note + handoff
+    dot->hyphen rewrite) must run for extension/preset commands registered via
+    CommandRegistrar. This exercises the REAL method (not a monkeypatched
+    marker), so it fails if Cline's override does not match the base hook name
+    the registrar dispatches to (post_process_command_content)."""
+
+    def test_cline_transforms_applied_via_registrar(
+        self, tmp_path, registrar, ext_dir
+    ):
+        ext, cmd_dir = ext_dir
+        body = (
+            "- For each executable hook, output the following:\n"
+            "agent: speckit.foo\n"
+        )
+        _write_cmd(cmd_dir, body=body)
+
+        commands = [{"name": "speckit.test.review", "file": "commands/review.md"}]
+        registrar.register_commands("cline", commands, "test-ext", ext, tmp_path)
+
+        outputs = list((tmp_path / ".clinerules" / "workflows").rglob("*.md"))
+        assert outputs, "no cline command file was written"
+        content = outputs[0].read_text(encoding="utf-8")
+
+        # _inject_hook_command_note fired (its note text contains "replace dots")
+        assert "replace dots" in content
+        # _rewrite_handoff_references rewrote the dotted agent handoff
+        assert "agent: speckit-foo" in content
+        assert "agent: speckit.foo" not in content
+
+
+def test_register_commands_propagates_programming_errors(tmp_path):
+    """Regression: narrowed exception must not swallow TypeError/AttributeError.
+
+    The invoke separator resolution narrowed from bare 'except Exception' to
+    'except (ImportError, ValueError, KeyError)'. Programming errors like
+    TypeError must propagate instead of being silently swallowed.
+    """
+    registrar = CommandRegistrar()
+    commands = [{"name": "test.cmd", "file": "commands/test.md"}]
+
+    ext_dir = tmp_path / "ext"
+    ext_dir.mkdir()
+
+    def _broken_get_integration(name):
+        raise TypeError("intentional programming error")
+
+    import specify_cli.integrations as integ_mod
+    original = integ_mod.get_integration
+    integ_mod.get_integration = _broken_get_integration
+    try:
+        with pytest.raises(TypeError, match="intentional programming error"):
+            registrar.register_commands("bob", commands, "ext", ext_dir, tmp_path)
+    finally:
+        integ_mod.get_integration = original
